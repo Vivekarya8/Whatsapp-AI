@@ -27,6 +27,7 @@ const {
   RAZORPAY_KEY_SECRET,    // from Razorpay Dashboard > Settings > API Keys
   RAZORPAY_WEBHOOK_SECRET,// a secret string YOU choose, set the same in Razorpay webhook settings
   ADVANCE_AMOUNT_RUPEES = "100", // booking advance amount collected via link
+  OWNER_NUMBER,           // your own WhatsApp number (with country code, no +), e.g. 919876543210 - for admin commands
   PORT = 3000,
 } = process.env;
 
@@ -54,6 +55,24 @@ const ICE_BREAKERS = {
 
 // Also trigger booking flow if the customer just types something booking-related
 const BOOKING_KEYWORDS = ["book", "booking", "slot"];
+
+// Keywords that should get a fixed reply instead of going to the AI
+const MENU_KEYWORDS = ["menu", "help", "hi", "hello", "hey"];
+const STATUS_KEYWORDS = ["status", "mera booking", "my booking"];
+const CANCEL_BOOKING_KEYWORDS = ["cancel booking", "booking cancel"];
+const OFFERS_KEYWORDS = ["offers", "offer", "discount"];
+
+const MENU_TEXT =
+  `Gamepay Cafe mein aapka swagat hai! 🎮\n\n` +
+  `Neeche se poocho:\n` +
+  `- "rates" - gaming rates\n` +
+  `- "games" - available games\n` +
+  `- "location" - cafe address & timing\n` +
+  `- "book" - slot book karo`;
+
+// Edit this whenever you have a running offer/combo deal
+const OFFERS_TEXT =
+  `Abhi koi special offer nahi chal raha. Rates jaanne ke liye "rates" type karo!`;
 
 // ---------- In-memory session store for the booking flow ----------
 // NOTE: this resets whenever the server restarts (e.g. Render free tier sleep/wake).
@@ -109,12 +128,44 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ============================================================
+// Owner-only commands - typed from OWNER_NUMBER only
+// ============================================================
+function handleOwnerCommand(lowerText) {
+  if (lowerText === "/pending") {
+    if (pendingBookings.size === 0) {
+      return "Koi pending (unpaid) booking nahi hai abhi.";
+    }
+    const lines = [...pendingBookings.values()].map(
+      (b, i) => `${i + 1}. ${b.phone} - ${b.dateTime} - ${b.gamePlayers}`
+    );
+    return `Pending bookings (${pendingBookings.size}):\n\n${lines.join("\n")}`;
+  }
+
+  // NOTE: "/today" and "/broadcast" aren't included yet because confirmed
+  // (paid) bookings and the customer list aren't saved anywhere in this
+  // code - only unpaid pendingBookings are tracked, and that's in-memory
+  // only (resets on server restart). Add a database/Sheet first, then
+  // these become possible.
+
+  return null; // not a recognized owner command
+}
+
+// ============================================================
 // Decide how to respond: continue a booking flow, start one,
 // or just answer as a normal FAQ via AI
 // ============================================================
 async function routeMessage(from, rawText) {
   const text = rawText.trim();
   const lower = text.toLowerCase();
+
+  // Owner-only commands - only work if the message comes from YOUR own
+  // WhatsApp number (set OWNER_NUMBER in Render env vars)
+  if (OWNER_NUMBER && from === OWNER_NUMBER) {
+    const ownerReply = handleOwnerCommand(lower);
+    if (ownerReply) return ownerReply;
+    // if it's not a recognized owner command, fall through to normal flow
+    // so you can also test the bot as a regular customer from your own number
+  }
 
   // Let the customer cancel a booking in progress anytime
   if (sessions.has(from) && ["cancel", "cancel karo", "band karo"].includes(lower)) {
@@ -125,6 +176,44 @@ async function routeMessage(from, rawText) {
   // If a booking flow is already in progress for this customer, continue it
   if (sessions.has(from)) {
     return continueBooking(from, text);
+  }
+
+  // "menu" / "help" / "hi" - fixed welcome text, no need to call the AI
+  if (MENU_KEYWORDS.some((k) => lower === k || lower.includes(k))) {
+    return MENU_TEXT;
+  }
+
+  // "status" / "mera booking" - check if they have an unpaid pending booking
+  if (STATUS_KEYWORDS.some((k) => lower.includes(k))) {
+    const pending = [...pendingBookings.values()].find((b) => b.phone === from);
+    if (pending) {
+      return (
+        `Aapki booking payment ka wait kar rahi hai:\n` +
+        `Date/Time: ${pending.dateTime}\n` +
+        `Game/Players: ${pending.gamePlayers}\n\n` +
+        `Payment link expire ho gaya ho to "book" type karke dobara try karo.`
+      );
+    }
+    return `Koi active/pending booking nahi mili aapke number pe. Naya booking karne ke liye "book" type karo!`;
+  }
+
+  // "cancel booking" - note: this can only cancel an UNPAID pending booking,
+  // since confirmed (paid) bookings aren't saved anywhere yet in this code
+  if (CANCEL_BOOKING_KEYWORDS.some((k) => lower.includes(k))) {
+    const entry = [...pendingBookings.entries()].find(([, b]) => b.phone === from);
+    if (entry) {
+      pendingBookings.delete(entry[0]);
+      return `Aapki pending booking cancel kar di gayi hai.`;
+    }
+    return (
+      `Aapke number pe koi pending (unpaid) booking nahi mili. ` +
+      `Agar aapne already payment kar diya hai, cafe pe call karke cancel karwa lein.`
+    );
+  }
+
+  // "offers" - fixed text, edit OFFERS_TEXT above whenever you run a deal
+  if (OFFERS_KEYWORDS.some((k) => lower.includes(k))) {
+    return OFFERS_TEXT;
   }
 
   // Ice breaker: "Ek gaming slot book karna hai" (or any booking-ish message)
