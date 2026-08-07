@@ -1,5 +1,5 @@
 // Gamepay Cafe - WhatsApp Cloud API Webhook Server
-// Handles: (1) Meta's webhook verification, (2) incoming messages, (3) AI reply via Claude
+// Handles: (1) Meta's webhook verification, (2) incoming messages, (3) AI reply via Gemini
 
 const express = require("express");
 const axios = require("axios");
@@ -12,7 +12,7 @@ const {
   VERIFY_TOKEN,        // any string you choose, must match what you put in Meta dashboard
   WHATSAPP_TOKEN,       // permanent access token from Meta (System User)
   PHONE_NUMBER_ID,      // from WhatsApp > API Setup in Meta dashboard
-  ANTHROPIC_API_KEY,    // Claude API key
+  GEMINI_API_KEY,       // Google Gemini API key (free tier)
   PORT = 3000,
 } = process.env;
 
@@ -26,10 +26,9 @@ Keep replies short (2-4 sentences), suitable for WhatsApp.
 
 --- Cafe details (edit this with your real info) ---
 Hours: 11 AM - 11 PM, all days
-Games available: PS5, PS3, Tekken Tag, GTA, Mustaffa, God Of War, Tekken 8, Spider Man
-Pricing: PS5 - Rs 150/hour, Tekken Tag - Rs 10 - 4 Coin, PS3 - 100/hour
-Address: [📍 Gamepay Cafe
-SHop No-5, CS1, Block C, Near SBI BANK & BANDHAN BANK, Nandgram, Ghaziabad, Uttar Pradesh]
+Games available: PS5, PC gaming (Valorant, FIFA, GTA V), pool table
+Pricing: PS5 - Rs 150/hour, PC - Rs 100/hour, Pool - Rs 200/hour
+Address: [your cafe address]
 `;
 
 // ============================================================
@@ -77,27 +76,33 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ============================================================
-// Call Claude to generate a reply
+// Call Gemini to generate a reply
 // ============================================================
 async function getAIReply(userMessage) {
   const response = await axios.post(
-    "https://api.anthropic.com/v1/messages",
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
     {
-      model: "claude-sonnet-4-6",
-      max_tokens: 300,
-      system: CAFE_CONTEXT,
-      messages: [{ role: "user", content: userMessage }],
+      system_instruction: {
+        parts: [{ text: CAFE_CONTEXT }],
+      },
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: userMessage }],
+        },
+      ],
+      generationConfig: {
+        maxOutputTokens: 300,
+      },
     },
     {
       headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
         "content-type": "application/json",
       },
     }
   );
 
-  return response.data.content[0].text;
+  return response.data.candidates[0].content.parts[0].text;
 }
 
 // ============================================================
