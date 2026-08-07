@@ -1,5 +1,6 @@
 // Gamepay Cafe - WhatsApp Cloud API Webhook Server
-// Handles: (1) Meta's webhook verification, (2) incoming messages, (3) AI reply via Gemini
+// Handles: (1) Meta's webhook verification, (2) incoming messages,
+// (3) AI reply via Gemini for FAQs, (4) a step-by-step booking flow
 
 const express = require("express");
 const axios = require("axios");
@@ -19,17 +20,32 @@ const {
 // ---------- Cafe info the AI will use to answer FAQs ----------
 const CAFE_CONTEXT = `
 You are the WhatsApp assistant for Gamepay Cafe, a gaming cafe.
-Answer customer questions about hours, pricing, and games briefly and in a friendly tone.
-If the customer wants to book a slot, ask which date, time, and how many hours/players,
-then say a booking confirmation and payment link will follow shortly.
-Keep replies short (2-4 sentences), suitable for WhatsApp.
+Answer customer questions about hours, pricing, games, and location briefly and in a friendly tone.
+Keep replies short (2-4 sentences), suitable for WhatsApp. Reply in the same language/style the customer used (Hindi/Hinglish/English).
+Do NOT handle bookings yourself - if a customer wants to book, tell them to type "book a slot" or use the "Ek gaming slot book karna hai" option.
 
 --- Cafe details (edit this with your real info) ---
 Hours: 11 AM - 11 PM, all days
 Games available: PS5, PC gaming (Valorant, FIFA, GTA V), pool table
 Pricing: PS5 - Rs 150/hour, PC - Rs 100/hour, Pool - Rs 200/hour
-Address: [your cafe address]
+Location: [your cafe address]
 `;
+
+// ---------- The exact 4 ice breaker texts set up in Meta dashboard ----------
+const ICE_BREAKERS = {
+  RATES: "aaj ke gaming rates kya hai?",
+  GAMES: "kaunse games available hai?",
+  LOCATION_TIMING: "cafe ka location & timing kya hai?",
+  BOOK: "ek gaming slot book karna hai",
+};
+
+// Also trigger booking flow if the customer just types something booking-related
+const BOOKING_KEYWORDS = ["book", "booking", "slot"];
+
+// ---------- In-memory session store for the booking flow ----------
+// NOTE: this resets whenever the server restarts (e.g. Render free tier sleep/wake).
+// Fine for a low-traffic cafe bot; move to a database/Sheet later if needed.
+const sessions = new Map(); // phone number -> { step, data }
 
 // ============================================================
 // STEP 1: Webhook verification (Meta calls this once when you
@@ -68,7 +84,7 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`Message from ${from}: ${text}`);
 
-    const reply = await getAIReply(text);
+    const reply = await routeMessage(from, text);
     await sendWhatsAppMessage(from, reply);
   } catch (err) {
     console.error("Error handling incoming message:", err.message);
@@ -76,7 +92,73 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ============================================================
-// Call Gemini to generate a reply
+// Decide how to respond: continue a booking flow, start one,
+// or just answer as a normal FAQ via AI
+// ============================================================
+async function routeMessage(from, rawText) {
+  const text = rawText.trim();
+  const lower = text.toLowerCase();
+
+  // Let the customer cancel a booking in progress anytime
+  if (sessions.has(from) && ["cancel", "cancel karo", "band karo"].includes(lower)) {
+    sessions.delete(from);
+    return "Theek hai, booking cancel kar di. Kuch aur poochna ho to batao!";
+  }
+
+  // If a booking flow is already in progress for this customer, continue it
+  if (sessions.has(from)) {
+    return continueBooking(from, text);
+  }
+
+  // Ice breaker: "Ek gaming slot book karna hai" (or any booking-ish message)
+  if (
+    lower === ICE_BREAKERS.BOOK ||
+    BOOKING_KEYWORDS.some((k) => lower.includes(k))
+  ) {
+    sessions.set(from, { step: "ask_date_time", data: {} });
+    return "Great! Booking ke liye bas 2 cheezein bata do:\n\nKaunsi date aur time chahiye? (jaise: 9 Aug, 6 PM)";
+  }
+
+  // Other 3 ice breakers (rates, games, location & timing) + any other FAQ
+  // just go straight to the AI, which already has all the cafe details.
+  return getAIReply(text);
+}
+
+// ============================================================
+// Step-by-step booking conversation
+// ============================================================
+async function continueBooking(from, text) {
+  const session = sessions.get(from);
+
+  if (session.step === "ask_date_time") {
+    session.data.dateTime = text;
+    session.step = "ask_game_players";
+    sessions.set(from, session);
+    return "Perfect. Ab batao:\n\nKaunsa game chahiye (PS5 / PC / Pool) aur kitne players/hours ke liye?";
+  }
+
+  if (session.step === "ask_game_players") {
+    session.data.gamePlayers = text;
+    sessions.delete(from); // booking flow complete
+
+    // TODO: Once Razorpay is integrated, generate a real payment link here
+    // and save this booking to a database/Google Sheet instead of just replying.
+    return (
+      `Booking summary:\n` +
+      `Date/Time: ${session.data.dateTime}\n` +
+      `Game/Players: ${session.data.gamePlayers}\n\n` +
+      `Aapki booking note kar li gayi hai! Payment link jaldi bhejenge confirm karne ke liye. ` +
+      `Kuch change karna ho to "cancel" likh ke dobara book kar sakte ho.`
+    );
+  }
+
+  // Fallback safety net - shouldn't normally reach here
+  sessions.delete(from);
+  return "Kuch gadbad ho gayi, dobara try karo - 'Ek gaming slot book karna hai' likho.";
+}
+
+// ============================================================
+// Call Gemini to generate a reply for FAQs
 // ============================================================
 async function getAIReply(userMessage) {
   const response = await axios.post(
