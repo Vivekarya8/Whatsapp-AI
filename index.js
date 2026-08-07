@@ -4,16 +4,29 @@
 
 const express = require("express");
 const axios = require("axios");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
-app.use(express.json());
+// Capture the raw request body too - Razorpay webhook signature verification
+// needs the exact raw bytes, not the parsed JSON object.
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 const {
-  VERIFY_TOKEN,        // any string you choose, must match what you put in Meta dashboard
-  WHATSAPP_TOKEN,       // permanent access token from Meta (System User)
-  PHONE_NUMBER_ID,      // from WhatsApp > API Setup in Meta dashboard
-  GEMINI_API_KEY,       // Google Gemini API key (free tier)
+  VERIFY_TOKEN,          // any string you choose, must match what you put in Meta dashboard
+  WHATSAPP_TOKEN,         // permanent access token from Meta (System User)
+  PHONE_NUMBER_ID,        // from WhatsApp > API Setup in Meta dashboard
+  GEMINI_API_KEY,         // Google Gemini API key (free tier)
+  RAZORPAY_KEY_ID,        // from Razorpay Dashboard > Settings > API Keys
+  RAZORPAY_KEY_SECRET,    // from Razorpay Dashboard > Settings > API Keys
+  RAZORPAY_WEBHOOK_SECRET,// a secret string YOU choose, set the same in Razorpay webhook settings
+  ADVANCE_AMOUNT_RUPEES = "100", // booking advance amount collected via link
   PORT = 3000,
 } = process.env;
 
@@ -46,6 +59,10 @@ const BOOKING_KEYWORDS = ["book", "booking", "slot"];
 // NOTE: this resets whenever the server restarts (e.g. Render free tier sleep/wake).
 // Fine for a low-traffic cafe bot; move to a database/Sheet later if needed.
 const sessions = new Map(); // phone number -> { step, data }
+
+// Tracks pending bookings so we know which customer to message when
+// Razorpay tells us a payment link was paid. Keyed by Razorpay payment_link id.
+const pendingBookings = new Map(); // payment_link_id -> { phone, dateTime, gamePlayers }
 
 // ============================================================
 // STEP 1: Webhook verification (Meta calls this once when you
@@ -141,15 +158,34 @@ async function continueBooking(from, text) {
     session.data.gamePlayers = text;
     sessions.delete(from); // booking flow complete
 
-    // TODO: Once Razorpay is integrated, generate a real payment link here
-    // and save this booking to a database/Google Sheet instead of just replying.
-    return (
-      `Booking summary:\n` +
-      `Date/Time: ${session.data.dateTime}\n` +
-      `Game/Players: ${session.data.gamePlayers}\n\n` +
-      `Aapki booking note kar li gayi hai! Payment link jaldi bhejenge confirm karne ke liye. ` +
-      `Kuch change karna ho to "cancel" likh ke dobara book kar sakte ho.`
-    );
+    try {
+      const { shortUrl, paymentLinkId } = await createPaymentLink(
+        from,
+        session.data.dateTime,
+        session.data.gamePlayers
+      );
+
+      // Remember this booking so we can confirm it once payment comes in
+      pendingBookings.set(paymentLinkId, {
+        phone: from,
+        dateTime: session.data.dateTime,
+        gamePlayers: session.data.gamePlayers,
+      });
+
+      return (
+        `Booking summary:\n` +
+        `Date/Time: ${session.data.dateTime}\n` +
+        `Game/Players: ${session.data.gamePlayers}\n\n` +
+        `Slot lock karne ke liye Rs ${ADVANCE_AMOUNT_RUPEES} advance pay kar do (baaki cafe pe pay kar dena):\n${shortUrl}\n\n` +
+        `Payment hote hi confirmation aa jayega.`
+      );
+    } catch (err) {
+      console.error("Razorpay error:", err.response?.data || err.message);
+      return (
+        `Booking note kar li hai (${session.data.dateTime}, ${session.data.gamePlayers}), ` +
+        `lekin payment link banane mein dikkat aa gayi. Cafe pe call karke confirm kar lena.`
+      );
+    }
   }
 
   // Fallback safety net - shouldn't normally reach here
@@ -188,8 +224,94 @@ async function getAIReply(userMessage) {
 }
 
 // ============================================================
-// Send a WhatsApp message back to the customer
+// Create a Razorpay Payment Link for the booking advance
 // ============================================================
+async function createPaymentLink(customerPhone, dateTime, gamePlayers) {
+  const auth = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString(
+    "base64"
+  );
+
+  const response = await axios.post(
+    "https://api.razorpay.com/v1/payment_links",
+    {
+      amount: Math.round(parseFloat(ADVANCE_AMOUNT_RUPEES) * 100), // paise
+      currency: "INR",
+      accept_partial: false,
+      description: `Gamepay Cafe booking - ${dateTime} - ${gamePlayers}`,
+      customer: {
+        contact: `+${customerPhone}`,
+      },
+      notify: {
+        sms: false,
+        email: false,
+        // We send the link ourselves via WhatsApp, so Razorpay's own
+        // notify channels are turned off to avoid duplicate messages.
+      },
+      reminder_enable: true,
+      notes: {
+        whatsapp_number: customerPhone,
+        date_time: dateTime,
+        game_players: gamePlayers,
+      },
+    },
+    {
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "content-type": "application/json",
+      },
+    }
+  );
+
+  return { shortUrl: response.data.short_url, paymentLinkId: response.data.id };
+}
+
+// ============================================================
+// Razorpay Webhook - fires when a payment link gets paid
+// Set this URL in Razorpay Dashboard > Settings > Webhooks:
+//   https://your-app.onrender.com/razorpay-webhook
+// Event to subscribe to: payment_link.paid
+// ============================================================
+app.post("/razorpay-webhook", async (req, res) => {
+  res.sendStatus(200); // acknowledge quickly
+
+  try {
+    const signature = req.headers["x-razorpay-signature"];
+    const expectedSignature = crypto
+      .createHmac("sha256", RAZORPAY_WEBHOOK_SECRET)
+      .update(req.rawBody)
+      .digest("hex");
+
+    if (signature !== expectedSignature) {
+      console.warn("Razorpay webhook signature mismatch - ignoring event");
+      return;
+    }
+
+    const event = req.body.event;
+    if (event !== "payment_link.paid") return;
+
+    const paymentLinkId = req.body.payload.payment_link.entity.id;
+    const booking = pendingBookings.get(paymentLinkId);
+
+    if (!booking) {
+      console.warn(`No pending booking found for payment link ${paymentLinkId}`);
+      return;
+    }
+
+    pendingBookings.delete(paymentLinkId);
+
+    await sendWhatsAppMessage(
+      booking.phone,
+      `Payment received! Aapki booking confirm ho gayi hai:\n` +
+        `Date/Time: ${booking.dateTime}\n` +
+        `Game/Players: ${booking.gamePlayers}\n\n` +
+        `Milte hai Gamepay Cafe mein!`
+    );
+  } catch (err) {
+    console.error("Error handling Razorpay webhook:", err.message);
+  }
+});
+
+
 async function sendWhatsAppMessage(to, text) {
   await axios.post(
     `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
