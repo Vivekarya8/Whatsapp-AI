@@ -70,9 +70,29 @@ const MENU_TEXT =
   `- "location" - cafe address & timing\n` +
   `- "book" - slot book karo`;
 
+// Body text shown above the buttons, and the rows themselves, for the
+// interactive "quick menu" sent when a customer says hi/menu/help.
+// Row "id" values are what come back in the webhook when a customer taps one -
+// they are matched in routeMessage() below.
+const QUICK_MENU_BODY = "Gamepay Cafe mein aapka swagat hai! 🎮\nNeeche se ek option chuno:";
+const QUICK_MENU_BUTTON_LABEL = "Menu dekho";
+const QUICK_MENU_ROWS = [
+  { id: "menu_book", title: "Book Slot", description: "Gaming slot book karo" },
+  { id: "menu_pricing", title: "Pricing", description: "Rates jaano" },
+  { id: "menu_timings", title: "Timings", description: "Cafe kab khula hai" },
+  { id: "menu_tournaments", title: "Tournaments", description: "Upcoming tournaments" },
+  { id: "menu_location", title: "Location", description: "Cafe ka address" },
+];
+
 // Edit this whenever you have a running offer/combo deal
 const OFFERS_TEXT =
   `Abhi koi special offer nahi chal raha. Rates jaanne ke liye "rates" type karo!`;
+
+const TOURNAMENTS_KEYWORDS = ["tournament", "tournaments"];
+
+// Edit this whenever you have a tournament scheduled
+const TOURNAMENTS_TEXT =
+  `Abhi koi tournament schedule nahi hai. Jaise hi announce hoga, yahin update kar denge!`;
 
 // ---------- In-memory session store for the booking flow ----------
 // NOTE: this resets whenever the server restarts (e.g. Render free tier sleep/wake).
@@ -114,14 +134,24 @@ app.post("/webhook", async (req, res) => {
     if (!message) return; // could be a status update (delivered/read), ignore
 
     const from = message.from; // customer's WhatsApp number
-    const text = message.text?.body;
 
-    if (!text) return; // ignoring non-text messages for now (images, audio, etc.)
+    // Plain text message, OR a tap on a list/button reply we sent earlier -
+    // both get turned into a "text" string that routeMessage() understands.
+    let text = message.text?.body;
+    if (!text && message.interactive) {
+      text =
+        message.interactive.list_reply?.id ||
+        message.interactive.button_reply?.id;
+    }
+
+    if (!text) return; // ignoring other message types (images, audio, etc.)
 
     console.log(`Message from ${from}: ${text}`);
 
     const reply = await routeMessage(from, text);
-    await sendWhatsAppMessage(from, reply);
+    // routeMessage() sends the interactive list itself (see QUICK_MENU) and
+    // returns null in that case - nothing more to send here.
+    if (reply) await sendWhatsAppMessage(from, reply);
   } catch (err) {
     console.error("Error handling incoming message:", err.message);
   }
@@ -178,9 +208,30 @@ async function routeMessage(from, rawText) {
     return continueBooking(from, text);
   }
 
-  // "menu" / "help" / "hi" - fixed welcome text, no need to call the AI
+  // "menu" / "help" / "hi" - send the interactive quick-menu (buttons/list)
   if (MENU_KEYWORDS.some((k) => lower === k || lower.includes(k))) {
-    return MENU_TEXT;
+    await sendWhatsAppList(
+      from,
+      QUICK_MENU_BODY,
+      QUICK_MENU_BUTTON_LABEL,
+      QUICK_MENU_ROWS
+    );
+    return null; // already sent above, nothing more to send
+  }
+
+  // Taps on the quick-menu rows (ids set in QUICK_MENU_ROWS above)
+  if (lower === "menu_book") {
+    sessions.set(from, { step: "ask_date_time", data: {} });
+    return "Great! Booking ke liye bas 2 cheezein bata do:\n\nKaunsi date aur time chahiye? (jaise: 9 Aug, 6 PM)";
+  }
+  if (lower === "menu_pricing") return getAIReply(ICE_BREAKERS.RATES);
+  if (lower === "menu_timings" || lower === "menu_location")
+    return getAIReply(ICE_BREAKERS.LOCATION_TIMING);
+  if (lower === "menu_tournaments") return TOURNAMENTS_TEXT;
+
+  // "tournaments" typed as plain text
+  if (TOURNAMENTS_KEYWORDS.some((k) => lower.includes(k))) {
+    return TOURNAMENTS_TEXT;
   }
 
   // "status" / "mera booking" - check if they have an unpaid pending booking
@@ -400,6 +451,41 @@ app.post("/razorpay-webhook", async (req, res) => {
   }
 });
 
+
+// ============================================================
+// Send an interactive "list" message (WhatsApp's version of a
+// menu with more than 3 buttons - up to 10 rows in one section).
+// This is what shows up when a customer taps the "hi"/menu command.
+// ============================================================
+async function sendWhatsAppList(to, bodyText, buttonLabel, rows) {
+  await axios.post(
+    `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive: {
+        type: "list",
+        body: { text: bodyText },
+        action: {
+          button: buttonLabel, // max 20 chars
+          sections: [
+            {
+              title: "Quick Menu",
+              rows, // each row: { id, title, description }
+            },
+          ],
+        },
+      },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        "content-type": "application/json",
+      },
+    }
+  );
+}
 
 async function sendWhatsAppMessage(to, text) {
   await axios.post(
