@@ -5,9 +5,32 @@
 const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
+const admin = require("firebase-admin");
 require("dotenv").config();
 
+// ---------- Firestore (same Firebase project as the website: "gamepay-cafe") ----------
+// FIREBASE_SERVICE_ACCOUNT_KEY = the whole service account JSON, as one string,
+// pasted into a Render/hosting environment variable. Get it from:
+// Firebase Console -> Project Settings -> Service Accounts -> Generate new private key
+admin.initializeApp({
+  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY)),
+});
+const db = admin.firestore();
+const bookingsCollection = db.collection("bookings");
+
 const app = express();
+
+// Allow the website (gamepaycafe.online) to call this server's /api/* routes.
+// If you later host the site on the exact same domain as this server, you
+// can remove this - but for now the site and this backend are separate.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
 // Capture the raw request body too - Razorpay webhook signature verification
 // needs the exact raw bytes, not the parsed JSON object.
 app.use(
@@ -103,6 +126,23 @@ const sessions = new Map(); // phone number -> { step, data }
 // Razorpay tells us a payment link was paid. Keyed by Razorpay payment_link id.
 const pendingBookings = new Map(); // payment_link_id -> { phone, dateTime, gamePlayers }
 
+// ---------- Website booking system ----------
+// Station prices - MUST match what's shown on the website. Edit here if you
+// change prices on the site, this is the source of truth for what gets charged.
+const STATION_PRICES = {
+  "PC Gaming Bay": 90,
+  "Console Zone": 80,
+  "VR Arena": 150,
+  "Squad Room": 350,
+};
+
+// Real, verified bookings made through the website (paid + signature-checked)
+// now live in Firestore (see bookingsCollection above), so they survive
+// server restarts. Doc ID = `${date}|${time}|${stationType}` to block
+// double-booking of the exact same slot.
+// Orders created but not yet paid - so verify-payment can look up what was booked.
+const pendingWebOrders = new Map(); // razorpay_order_id -> booking details
+
 // ============================================================
 // STEP 1: Webhook verification (Meta calls this once when you
 // set up the webhook URL in the dashboard)
@@ -118,6 +158,171 @@ app.get("/webhook", (req, res) => {
   }
   return res.sendStatus(403);
 });
+
+// ============================================================
+// STEP 1.5: Website Booking & Payment API
+// These are the endpoints the website's booking form calls.
+// Flow: create-order (get a Razorpay order) -> customer pays in the
+// Razorpay popup -> verify-payment (we confirm it's real) -> booking saved.
+// ============================================================
+
+// GET /api/booked-slots?date=2026-09-15
+// Website calls this to grey out time slots that are already taken.
+app.get("/api/booked-slots", async (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: "date is required" });
+
+  try {
+    const snapshot = await bookingsCollection.where("date", "==", date).get();
+    const taken = snapshot.docs.map((doc) => {
+      const b = doc.data();
+      return { time: b.time, stationType: b.stationType };
+    });
+    res.json({ taken });
+  } catch (err) {
+    console.error("booked-slots error:", err.message);
+    res.status(500).json({ error: "Could not check availability" });
+  }
+});
+
+// POST /api/create-order
+// Body: { stationType, duration, date, time, name, phone }
+// Creates a real Razorpay order for the exact amount (calculated server-side,
+// never trust a price sent from the browser) and returns what Checkout.js needs.
+app.post("/api/create-order", async (req, res) => {
+  try {
+    const { stationType, duration, date, time, name, phone } = req.body;
+
+    const hourlyRate = STATION_PRICES[stationType];
+    if (!hourlyRate) {
+      return res.status(400).json({ error: "Invalid station type" });
+    }
+    const hours = parseInt(duration, 10);
+    if (!hours || hours < 1 || hours > 12) {
+      return res.status(400).json({ error: "Invalid duration" });
+    }
+    if (!date || !time || !name || !phone) {
+      return res.status(400).json({ error: "Missing booking details" });
+    }
+
+    // Block double-booking the same station + slot
+    const slotKey = `${date}|${time}|${stationType}`;
+    const existingDoc = await bookingsCollection.doc(slotKey).get();
+    if (existingDoc.exists) {
+      return res.status(409).json({ error: "This slot is already booked. Please pick another." });
+    }
+
+    const amountRupees = hourlyRate * hours;
+
+    const auth = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
+    const orderResponse = await axios.post(
+      "https://api.razorpay.com/v1/orders",
+      {
+        amount: Math.round(amountRupees * 100), // paise
+        currency: "INR",
+        receipt: `booking_${Date.now()}`,
+        notes: { stationType, duration: hours, date, time, name, phone },
+      },
+      { headers: { Authorization: `Basic ${auth}`, "content-type": "application/json" } }
+    );
+
+    const order = orderResponse.data;
+
+    // Remember what this order was for, so verify-payment can save it once paid
+    pendingWebOrders.set(order.id, { stationType, duration: hours, date, time, name, phone, amountRupees });
+
+    res.json({
+      orderId: order.id,
+      amount: order.amount, // in paise, Checkout.js needs this exact value
+      currency: order.currency,
+      key: RAZORPAY_KEY_ID, // public key id - safe to expose to the browser
+    });
+  } catch (err) {
+    console.error("create-order error:", err.response?.data || err.message);
+    res.status(500).json({ error: "Could not create order. Please try again." });
+  }
+});
+
+// POST /api/verify-payment
+// Body: { razorpay_order_id, razorpay_payment_id, razorpay_signature }
+// Called by the website right after Razorpay Checkout succeeds. We verify the
+// signature ourselves - this is the step that makes the payment "real"
+// instead of trusting whatever the browser tells us.
+app.post("/api/verify-payment", async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: "Missing payment details" });
+    }
+
+    const expectedSignature = crypto
+      .createHmac("sha256", RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      console.warn("Payment signature mismatch - possible tampering attempt");
+      return res.status(400).json({ error: "Payment verification failed" });
+    }
+
+    const booking = pendingWebOrders.get(razorpay_order_id);
+    if (!booking) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    pendingWebOrders.delete(razorpay_order_id);
+
+    const slotKey = `${booking.date}|${booking.time}|${booking.stationType}`;
+    const bookingRecord = { ...booking, paymentId: razorpay_payment_id, bookedAt: new Date().toISOString() };
+
+    // Transaction = if two people somehow pay for the same slot at almost the
+    // same moment, only the first write wins - the second is safely rejected
+    // here instead of silently overwriting the first booking.
+    try {
+      await db.runTransaction(async (t) => {
+        const docRef = bookingsCollection.doc(slotKey);
+        const doc = await t.get(docRef);
+        if (doc.exists) {
+          throw new Error("SLOT_TAKEN");
+        }
+        t.set(docRef, bookingRecord);
+      });
+    } catch (err) {
+      if (err.message === "SLOT_TAKEN") {
+        // Refunding is a manual step in Razorpay dashboard for now - flagged here
+        console.error(`DOUBLE BOOKING PAID for ${slotKey} - refund payment ${razorpay_payment_id} manually`);
+        return res.status(409).json({ error: "Slot was just taken. Contact us for a refund - we'll sort it out." });
+      }
+      throw err;
+    }
+
+    const confirmationText =
+      `Booking confirmed! ✅\n\n` +
+      `${booking.stationType} - ${booking.duration}hr\n` +
+      `${booking.date}, ${booking.time}\n` +
+      `Amount paid: ₹${booking.amountRupees}\n\n` +
+      `See you at GamePay Cafe! 🎮`;
+
+    // Notify the customer on WhatsApp (only if they gave a valid WhatsApp number)
+    if (booking.phone) {
+      sendWhatsAppMessage(booking.phone, confirmationText).catch((e) =>
+        console.error("Failed to send customer confirmation:", e.message)
+      );
+    }
+    // Notify you (the owner) so staff know to expect them
+    if (OWNER_NUMBER) {
+      sendWhatsAppMessage(
+        OWNER_NUMBER,
+        `🎮 New website booking!\n${booking.name} - ${booking.phone}\n${confirmationText}`
+      ).catch((e) => console.error("Failed to notify owner:", e.message));
+    }
+
+    res.json({ success: true, message: "Booking confirmed" });
+  } catch (err) {
+    console.error("verify-payment error:", err.response?.data || err.message);
+    res.status(500).json({ error: "Something went wrong verifying payment" });
+  }
+});
+
 
 // ============================================================
 // STEP 2: Receiving incoming WhatsApp messages
