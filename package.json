@@ -1,7 +1,7 @@
 {
-  "name": "gamepay-webhook",
+  "name": "gamepay-cafe-bot",
   "version": "1.0.0",
-  "description": "WhatsApp Cloud API webhook for Gamepay Cafe",
+  "description": "GamePay Cafe - WhatsApp bot + website booking/payment backend",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +9,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "axios": "^1.7.2",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^12.3.1"
   }
 }
