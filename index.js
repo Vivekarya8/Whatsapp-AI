@@ -63,11 +63,10 @@ Answer customer questions about hours, pricing, games, and location briefly and 
 Keep replies short (2-4 sentences), suitable for WhatsApp. Reply in the same language/style the customer used (Hindi/Hinglish/English).
 Do NOT handle bookings yourself - if a customer wants to book, tell them to type "book a slot" or use the "Ek gaming slot book karna hai" option.
 
---- Cafe details (edit this with your real info) ---
-Hours: 11 AM - 11 PM, all days
-Games available: PS5, PC gaming (Valorant, FIFA, GTA V), pool table
-Pricing: PS5 - Rs 150/hour, PC - Rs 100/hour, Pool - Rs 200/hour
-Location: [your cafe address]
+--- Cafe details ---
+Hours: 9 AM - 1 AM, all days
+Stations and pricing: PC Gaming Bay - Rs 90/hour; Console Zone - Rs 80/hour; VR Arena - Rs 150/hour; Squad Room - Rs 350/hour
+Location: C5, Block C, Nandgram, Ghaziabad, Uttar Pradesh
 `;
 
 const ICE_BREAKERS = {
